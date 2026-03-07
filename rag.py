@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Academic paper RAG search — CLI interface for Claude Code."""
 
-import os
+import re
 import sys
 from pathlib import Path
 
 import click
 import lancedb
+from lancedb.rerankers import RRFReranker
 from rich.console import Console
 from rich.markdown import Markdown
 from sentence_transformers import SentenceTransformer
@@ -34,8 +35,18 @@ def chunk_markdown(text: str, source: str) -> list[dict]:
     current_chunk = []
     current_len = 0
     current_headers = []
+    chunk_idx = 0
+
+    # Try to extract page numbers from Marker's span tags
+    current_page = ""
+    page_pattern = re.compile(r'<span id="page-(\d+)')
 
     for line in lines:
+        # Track page numbers from Marker output
+        page_match = page_pattern.search(line)
+        if page_match:
+            current_page = page_match.group(1)
+
         # Track headers for context
         if line.startswith("#"):
             level = len(line) - len(line.lstrip("#"))
@@ -52,7 +63,10 @@ def chunk_markdown(text: str, source: str) -> list[dict]:
                 "text": chunk_text,
                 "source": source,
                 "section": header_context,
+                "chunk_id": f"{source}:{chunk_idx}",
+                "page": current_page,
             })
+            chunk_idx += 1
 
             # Overlap: keep last few lines
             overlap_lines = []
@@ -73,6 +87,8 @@ def chunk_markdown(text: str, source: str) -> list[dict]:
             "text": "\n".join(current_chunk),
             "source": source,
             "section": header_context,
+            "chunk_id": f"{source}:{chunk_idx}",
+            "page": current_page,
         })
 
     return chunks
@@ -120,8 +136,13 @@ def ingest():
     if TABLE_NAME in db.list_tables().tables:
         db.drop_table(TABLE_NAME)
 
-    db.create_table(TABLE_NAME, all_chunks)
-    console.print(f"\n[green]Done. {len(all_chunks)} chunks indexed in {DB_PATH}[/green]")
+    table = db.create_table(TABLE_NAME, all_chunks)
+
+    # Create full-text search index on the text column for hybrid search
+    console.print("[bold]Creating full-text search index...[/bold]")
+    table.create_fts_index("text", replace=True)
+
+    console.print(f"\n[green]Done. {len(all_chunks)} chunks indexed with vector + FTS in {DB_PATH}[/green]")
 
 
 @cli.command()
@@ -129,7 +150,9 @@ def ingest():
 @click.option("-n", "--top-n", default=5, help="Number of results to return")
 @click.option("-s", "--source", default=None, help="Filter by source filename")
 @click.option("--raw", is_flag=True, help="Plain text output (no formatting)")
-def search(query: str, top_n: int, source: str, raw: bool):
+@click.option("--mode", type=click.Choice(["hybrid", "vector", "fts"]), default="hybrid",
+              help="Search mode: hybrid (default), vector-only, or full-text-only")
+def search(query: str, top_n: int, source: str, raw: bool, mode: str):
     """Search papers with a natural language query."""
     model = get_model()
     db = lancedb.connect(str(DB_PATH))
@@ -140,9 +163,21 @@ def search(query: str, top_n: int, source: str, raw: bool):
 
     table = db.open_table(TABLE_NAME)
 
-    query_embedding = model.encode([query])[0].tolist()
-
-    results = table.search(query_embedding).limit(top_n)
+    if mode == "hybrid":
+        query_embedding = model.encode([query])[0].tolist()
+        reranker = RRFReranker()
+        results = (
+            table.search(query_type="hybrid")
+            .vector(query_embedding)
+            .text(query)
+            .rerank(reranker)
+            .limit(top_n)
+        )
+    elif mode == "vector":
+        query_embedding = model.encode([query])[0].tolist()
+        results = table.search(query_embedding).limit(top_n)
+    else:  # fts
+        results = table.search(query, query_type="fts").limit(top_n)
 
     if source:
         results = results.where(f"source = '{source}'")
@@ -153,16 +188,22 @@ def search(query: str, top_n: int, source: str, raw: bool):
         print("No results found.")
         return
 
+    # Determine which score column is available
+    score_col = "_relevance_score" if "_relevance_score" in results.columns else "_distance"
+
     if raw:
-        # Plain text output for Claude Code consumption
-        for i, row in results.iterrows():
-            print(f"--- [{row['source']}] {row['section']} (score: {row['_distance']:.4f}) ---")
+        for _, row in results.iterrows():
+            score = row.get(score_col, 0)
+            page_info = f" p.{row['page']}" if row.get("page") else ""
+            print(f"--- [{row['source']}{page_info}] {row['section']} ({score_col}: {score:.4f}) ---")
             print(row["text"])
             print()
     else:
-        for i, row in results.iterrows():
-            console.rule(f"[bold cyan]{row['source']}[/bold cyan] | {row['section']}")
-            console.print(f"[dim]Relevance: {1 - row['_distance']:.4f}[/dim]\n")
+        for _, row in results.iterrows():
+            score = row.get(score_col, 0)
+            page_info = f" p.{row['page']}" if row.get("page") else ""
+            console.rule(f"[bold cyan]{row['source']}{page_info}[/bold cyan] | {row['section']}")
+            console.print(f"[dim]{score_col}: {score:.4f}[/dim]\n")
             console.print(Markdown(row["text"]))
             console.print()
 

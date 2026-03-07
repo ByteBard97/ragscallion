@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Minimal HTTP wrapper for the RAG search CLI."""
 
-import json
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import lancedb
+from lancedb.rerankers import RRFReranker
 from sentence_transformers import SentenceTransformer
 
 DB_PATH = Path(__file__).parent / "vectordb"
@@ -17,6 +17,7 @@ EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 # Load model once at startup
 print("Loading embedding model...", flush=True)
 model = SentenceTransformer(EMBED_MODEL, device="cuda")
+reranker = RRFReranker()
 print("Ready.", flush=True)
 
 
@@ -54,6 +55,7 @@ class Handler(BaseHTTPRequestHandler):
 
         top_n = int(params.get("n", ["5"])[0])
         source = params.get("source", [None])[0]
+        mode = params.get("mode", ["hybrid"])[0]
 
         db = get_db()
         if TABLE_NAME not in db.list_tables().tables:
@@ -61,18 +63,38 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         table = db.open_table(TABLE_NAME)
-        query_embedding = model.encode([query])[0].tolist()
-        results = table.search(query_embedding).limit(top_n)
+
+        if mode == "hybrid":
+            query_embedding = model.encode([query])[0].tolist()
+            results = (
+                table.search(query_type="hybrid")
+                .vector(query_embedding)
+                .text(query)
+                .rerank(reranker)
+                .limit(top_n)
+            )
+        elif mode == "vector":
+            query_embedding = model.encode([query])[0].tolist()
+            results = table.search(query_embedding).limit(top_n)
+        elif mode == "fts":
+            results = table.search(query, query_type="fts").limit(top_n)
+        else:
+            self.send_error(400, "mode must be hybrid, vector, or fts")
+            return
 
         if source:
             results = results.where(f"source = '{source}'")
 
         results = results.to_pandas()
 
+        score_col = "_relevance_score" if "_relevance_score" in results.columns else "_distance"
+
         output = []
         for _, row in results.iterrows():
+            score = row.get(score_col, 0)
+            page_info = f" p.{row['page']}" if row.get("page") else ""
             output.append(
-                f"--- [{row['source']}] {row['section']} (score: {row['_distance']:.4f}) ---\n"
+                f"--- [{row['source']}{page_info}] {row['section']} ({score_col}: {score:.4f}) ---\n"
                 f"{row['text']}\n"
             )
 
@@ -109,8 +131,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(text.encode())
 
     def log_message(self, format, *args):
-        # Only log errors, not every request
-        if args and str(args[0]).startswith("4") or str(args[0]).startswith("5"):
+        if args and (str(args[0]).startswith("4") or str(args[0]).startswith("5")):
             super().log_message(format, *args)
 
 
