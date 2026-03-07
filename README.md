@@ -10,6 +10,13 @@
   <em>A scrappy, local-first RAG server</em>
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.12+-blue?logo=python&logoColor=white" alt="Python 3.12+">
+  <img src="https://img.shields.io/badge/CUDA-GPU%20accelerated-76b900?logo=nvidia&logoColor=white" alt="GPU Accelerated">
+  <img src="https://img.shields.io/badge/search-hybrid%20vector%20%2B%20BM25-teal" alt="Hybrid Search">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+</p>
+
 Drop in PDFs, API docs, scientific papers — anything — and query it over HTTP. No frameworks, no API keys, no cloud.
 
 ```
