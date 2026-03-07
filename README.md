@@ -83,13 +83,13 @@ mkdir -p docs
 cp your-documents/*.md docs/
 ```
 
-**Converting PDFs?** Use [Marker](https://github.com/VikParuchuri/marker):
+**Converting PDFs?** Ragscallion works with markdown, so you'll need to convert PDFs first. We recommend [Marker](https://github.com/VikParuchuri/marker) — it's excellent at extracting text from scientific papers and technical docs while preserving structure, tables, and equations. Marker is **not** included in Ragscallion's dependencies because it's a large package with its own model downloads. Install it separately:
 
 ```bash
-# Install marker as a standalone tool
+# Install marker as a standalone tool (won't pollute the ragscallion venv)
 uv tool install marker-pdf
 
-# Or use the included helper script
+# Then use the included helper script to convert + ingest in one step
 ./scripts/add-paper.sh paper.pdf
 ```
 
