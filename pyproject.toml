@@ -1,7 +1,7 @@
 [project]
-name = "rag-server"
+name = "ragscallion"
 version = "0.1.0"
-description = "Add your description here"
+description = "A scrappy, local-first RAG server for coding agents. Hybrid search over your docs via HTTP."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
