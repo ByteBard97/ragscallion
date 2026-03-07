@@ -1,6 +1,16 @@
-# Ragscallion
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.webp">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-light.webp">
+    <img alt="Ragscallion" src="assets/logo-light.webp" width="400">
+  </picture>
+</p>
 
-A scrappy, local-first RAG server that gives your coding agent a searchable knowledge base. Drop in PDFs, API docs, scientific papers — anything — and query it over HTTP. No frameworks, no API keys, no cloud.
+<p align="center">
+  <em>A scrappy, local-first RAG server</em>
+</p>
+
+Drop in PDFs, API docs, scientific papers — anything — and query it over HTTP. No frameworks, no API keys, no cloud.
 
 ```
 Your coding agent                        Your machine (GPU)
