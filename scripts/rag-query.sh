@@ -17,7 +17,7 @@
 #   rag-query --sources
 #   rag-query --stats
 
-RAG_HOST="${RAG_HOST:-192.168.0.200}"
+RAG_HOST="${RAG_HOST:-localhost}"
 RAG_PORT="${RAG_PORT:-8085}"
 BASE="http://${RAG_HOST}:${RAG_PORT}"
 

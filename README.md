@@ -38,6 +38,24 @@ Most RAG tools are either **heavyweight frameworks** (LangChain, LlamaIndex) or 
 - **Zero infrastructure** — no Docker, no cloud, no API keys. Just `uv` and a CUDA GPU.
 - **Drop-in documents** — markdown, extracted PDFs (via Marker), API docs, whatever. If it's text, it works.
 
+## How It Compares
+
+| | Ragscallion | [paper-qa](https://github.com/Future-House/paper-qa) | [RAGFlow](https://github.com/infiniflow/ragflow) | [mcp-local-rag](https://github.com/shinpr/mcp-local-rag) | [LangChain RAG](https://github.com/langchain-ai/rag-from-scratch) |
+|---|---|---|---|---|---|
+| **Setup** | `uv sync` | pip + OpenAI key | Docker Compose | npm + MCP config | pip + API keys |
+| **Search** | Hybrid (vector + BM25) | Vector only | Hybrid | Hybrid | Vector only |
+| **GPU** | Local CUDA | Cloud API | Optional | CPU only | Cloud API |
+| **Interface** | HTTP + CLI | Python API | Web UI | MCP (Claude only) | Python API |
+| **Agent-agnostic** | Any agent that can curl | Python only | Browser only | Claude only | Python only |
+| **Dependencies** | 7 packages | 20+ | Docker + Elasticsearch + Redis | Node.js + MCP SDK | LangChain ecosystem |
+| **API keys needed** | None | OpenAI | Optional | None | OpenAI/other |
+
+**Ragscallion is for you if:**
+- You want a coding agent (any agent) to search your local docs
+- You don't want to send documents to a cloud API
+- You have a CUDA GPU and want fast local embeddings
+- You want something you can set up in 5 minutes and forget about
+
 ## Quick Start
 
 ### Requirements
