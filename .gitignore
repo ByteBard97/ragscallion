@@ -11,3 +11,11 @@ wheels/
 
 # Vector database (regenerated via `rag ingest`)
 vectordb/
+
+# User documents (add your own, don't commit copyrighted material)
+docs/
+
+# Working logo files (final versions are in assets/)
+*.webp
+*.png
+!assets/

@@ -120,7 +120,7 @@ uv run python server.py 8085
 # Or install as a systemd service (see below)
 ```
 
-Query from anywhere on your network:
+Query from anywhere on your network (find your IP with `hostname -I` or `ip addr`):
 
 ```bash
 curl "http://your-machine:8085/search?q=steiner+tree+heuristic&n=5"
