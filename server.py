@@ -252,8 +252,7 @@ async def submit_ingest(
     file: UploadFile = File(...),
     corpus_id: str = Form(...),
     source_label: str = Form(...),
-    on_conflict: str = Form("error"),
-    background_tasks: BackgroundTasks = None
+    on_conflict: str = Form("error")
 ):
     """
     Submit PDF for async conversion and indexing.
@@ -270,26 +269,67 @@ async def submit_ingest(
     - status: queued
     - server_now: server's current time (RFC3339)
     """
+    # Validate file type
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+
     # Validate corpus_id format
     import re
     if not re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", corpus_id):
         raise HTTPException(
             status_code=400,
-            detail="corpus_id must match ^[a-z0-9][a-z0-9_-]{0,63}$"
+            detail="corpus_id must match regex ^[a-z0-9][a-z0-9_-]{0,63}$"
         )
 
-    # Check for source_label collision
-    # (Full implementation in Task 3)
+    # Validate on_conflict parameter
+    if on_conflict not in ("error", "append", "replace"):
+        raise HTTPException(
+            status_code=400,
+            detail="on_conflict must be error, append, or replace"
+        )
 
     # Generate job ID
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+
+    # Save PDF to staging directory
+    staging_dir = Path(__file__).parent / "staging"
+    staging_dir.mkdir(exist_ok=True)
+    pdf_path = staging_dir / f"{job_id}.pdf"
+
+    try:
+        # Write uploaded file to disk
+        contents = await file.read()
+        pdf_path.write_bytes(contents)
+        logger.info(f"Saved PDF to {pdf_path} ({len(contents)} bytes)")
+    except Exception as e:
+        logger.error(f"Failed to save PDF: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save uploaded file")
 
     # Store job metadata
     conn = sqlite3.connect(str(METADATA_DB_PATH))
     cursor = conn.cursor()
 
     try:
+        # Check for existing source_label based on on_conflict policy
+        cursor.execute(
+            "SELECT job_id, status FROM jobs WHERE corpus_id = ? AND source_label = ?",
+            (corpus_id, source_label)
+        )
+        existing = cursor.fetchone()
+
+        if existing and on_conflict == "error":
+            pdf_path.unlink()  # Clean up the uploaded file
+            conn.close()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "collision",
+                    "message": f"source_label '{source_label}' already exists in corpus '{corpus_id}'"
+                }
+            )
+
+        # Insert new job
         cursor.execute("""
             INSERT INTO jobs
             (job_id, corpus_id, source_label, status, created_at, updated_at)
@@ -303,17 +343,11 @@ async def submit_ingest(
         """, (corpus_id, now))
 
         conn.commit()
+
     except sqlite3.IntegrityError as e:
-        if "UNIQUE constraint failed" in str(e):
-            conn.close()
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "collision",
-                    "message": f"source_label '{source_label}' already exists in corpus '{corpus_id}'"
-                }
-            )
-        raise
+        pdf_path.unlink()
+        logger.error(f"Database error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to queue job")
     finally:
         conn.close()
 
@@ -322,12 +356,15 @@ async def submit_ingest(
     # Queue job for processing (background task — implemented in Task 5)
     # For now, just return immediately
 
-    return {
-        "job_id": job_id,
-        "corpus_id": corpus_id,
-        "status": "queued",
-        "server_now": datetime.now(timezone.utc).isoformat() + "Z"
-    }
+    return JSONResponse(
+        status_code=202,  # Accepted
+        content={
+            "job_id": job_id,
+            "corpus_id": corpus_id,
+            "status": "queued",
+            "server_now": datetime.now(timezone.utc).isoformat() + "Z"
+        }
+    )
 
 
 # ─── Job Polling Endpoint (Task 4) ──────────────────────────────────────
