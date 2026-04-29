@@ -24,10 +24,17 @@ DB_PATH = Path(__file__).parent / "vectordb"
 METADATA_DB_PATH = Path(__file__).parent / "metadata.db"
 DOCS_PATH = Path(__file__).parent / "docs"
 EMBED_MODEL = "BAAI/bge-base-en-v1.5"
+LEGACY_CORPUS_ID = "legacy"  # Default corpus for backwards compatibility
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def corpus_table_name(corpus_id: str) -> str:
+    """Map corpus_id to LanceDB table name (alphanumeric safe)."""
+    # Replace hyphens and underscores with underscores, ensure alphanumeric
+    return f"corpus_{corpus_id.replace('-', '_')}"
 
 # ─── Global State ───────────────────────────────────────────────────────
 
@@ -262,49 +269,84 @@ async def health():
 async def stats():
     """Return index statistics (multi-corpus aware)."""
     db = _get_db()
-    tables = db.list_tables().tables
+    all_tables = db.list_tables().tables
 
-    if not tables:
+    if not all_tables:
         return {"status": "no_index", "message": "Run ingestion first"}
 
     stats_data = {}
-    for table_name in tables:
+    total_chunks = 0
+    total_corpora = 0
+
+    for table_name in all_tables:
+        if not table_name.startswith("corpus_"):
+            continue
+
+        corpus_id = table_name.replace("corpus_", "").replace("_", "-")
         try:
             table = db.open_table(table_name)
             df = table.to_pandas()
             sources = df["source"].unique()
-            stats_data[table_name] = {
-                "chunks": len(df),
-                "sources": len(sources),
-                "source_list": list(sources)
-            }
-        except Exception as e:
-            logger.error(f"Error reading table {table_name}: {e}")
+            chunks = len(df)
 
-    return {"corpora": stats_data}
+            stats_data[corpus_id] = {
+                "chunks": chunks,
+                "sources": len(sources),
+                "source_list": sorted(sources.tolist())
+            }
+
+            total_chunks += chunks
+            total_corpora += 1
+
+        except Exception as e:
+            logger.error(f"Error reading corpus {corpus_id}: {e}")
+
+    return {
+        "status": "ok",
+        "total_chunks": total_chunks,
+        "total_corpora": total_corpora,
+        "corpora": stats_data
+    }
 
 
 @app.get("/sources")
 async def sources(corpus: Optional[str] = None):
     """List all sources across corpora or within a specific corpus."""
     db = _get_db()
-    tables = db.list_tables().tables
+    all_tables = db.list_tables().tables
+
+    sources_by_corpus = {}
 
     if corpus:
-        if corpus not in tables:
+        # Single corpus
+        table_name = corpus_table_name(corpus)
+        if table_name not in all_tables:
             raise HTTPException(status_code=404, detail=f"Corpus '{corpus}' not found")
-        tables = [corpus]
 
-    all_sources = {}
-    for table_name in tables:
         try:
             table = db.open_table(table_name)
             df = table.to_pandas()
-            all_sources[table_name] = sorted(df["source"].unique().tolist())
+            sources_by_corpus[corpus] = sorted(df["source"].unique().tolist())
         except Exception as e:
-            logger.error(f"Error reading table {table_name}: {e}")
+            logger.error(f"Error reading corpus {corpus}: {e}")
+            sources_by_corpus[corpus] = []
 
-    return {"corpora": all_sources}
+    else:
+        # All corpora
+        for table_name in all_tables:
+            if not table_name.startswith("corpus_"):
+                continue
+
+            corpus_id = table_name.replace("corpus_", "").replace("_", "-")
+            try:
+                table = db.open_table(table_name)
+                df = table.to_pandas()
+                sources_by_corpus[corpus_id] = sorted(df["source"].unique().tolist())
+            except Exception as e:
+                logger.error(f"Error reading corpus {corpus_id}: {e}")
+                sources_by_corpus[corpus_id] = []
+
+    return {"corpora": sources_by_corpus}
 
 
 # ─── Search Endpoint ────────────────────────────────────────────────────
@@ -324,19 +366,30 @@ async def search(q: str, n: int = 5, mode: str = "hybrid", corpus: Optional[str]
         raise HTTPException(status_code=400, detail="Missing ?q= parameter")
 
     db = _get_db()
-    tables = db.list_tables().tables
+    all_tables = db.list_tables().tables
 
-    if not tables:
+    if not all_tables:
         raise HTTPException(status_code=500, detail="No index found. Run ingestion first.")
 
+    # Determine which corpus/tables to search
+    tables_to_search = {}
+
     if corpus:
-        if corpus not in tables:
+        # Search specific corpus
+        table_name = corpus_table_name(corpus)
+        if table_name not in all_tables:
             raise HTTPException(status_code=404, detail=f"Corpus '{corpus}' not found")
-        tables = [corpus]
+        tables_to_search[corpus] = table_name
+    else:
+        # Search all corpora — map table names back to corpus IDs
+        for table_name in all_tables:
+            if table_name.startswith("corpus_"):
+                corpus_id = table_name.replace("corpus_", "").replace("_", "-")
+                tables_to_search[corpus_id] = table_name
 
     results_by_corpus = {}
 
-    for table_name in tables:
+    for corpus_id, table_name in tables_to_search.items():
         try:
             table = db.open_table(table_name)
 
@@ -374,11 +427,11 @@ async def search(q: str, n: int = 5, mode: str = "hybrid", corpus: Optional[str]
                     "score_type": score_col
                 })
 
-            results_by_corpus[table_name] = results_list
+            results_by_corpus[corpus_id] = results_list
 
         except Exception as e:
-            logger.error(f"Error searching table {table_name}: {e}")
-            results_by_corpus[table_name] = []
+            logger.error(f"Error searching corpus {corpus_id}: {e}")
+            results_by_corpus[corpus_id] = []
 
     return {"query": q, "mode": mode, "results": results_by_corpus}
 
