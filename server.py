@@ -57,32 +57,54 @@ async def startup():
 def _init_metadata_db():
     """Create metadata.db schema if not exists."""
     conn = sqlite3.connect(str(METADATA_DB_PATH))
+    conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging for concurrent access
     cursor = conn.cursor()
 
+    # Jobs table: tracks ingest jobs (queued → converting → ready/failed)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             job_id TEXT PRIMARY KEY,
             corpus_id TEXT NOT NULL,
             source_label TEXT NOT NULL,
+
             status TEXT DEFAULT 'queued',
-            created_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
             started_at TEXT,
             completed_at TEXT,
+
             error_message TEXT,
-            chunks_indexed INTEGER DEFAULT 0
+            chunks_indexed INTEGER DEFAULT 0,
+
+            UNIQUE(corpus_id, source_label)
         )
     """)
 
+    # Corpora table: tracks multi-corpus inventory
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS corpora (
             corpus_id TEXT PRIMARY KEY,
-            created_at TEXT,
-            source_count INTEGER DEFAULT 0
+            created_at TEXT NOT NULL,
+            source_count INTEGER DEFAULT 0,
+            chunk_count INTEGER DEFAULT 0
         )
+    """)
+
+    # Indexes for fast polling and queries
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_jobs_status_updated
+        ON jobs(status, updated_at DESC)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_jobs_corpus
+        ON jobs(corpus_id)
     """)
 
     conn.commit()
     conn.close()
+
+    logger.info("Metadata database initialized")
 
 
 def _get_db():
@@ -266,12 +288,34 @@ async def submit_ingest(
     # Store job metadata
     conn = sqlite3.connect(str(METADATA_DB_PATH))
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO jobs (job_id, corpus_id, source_label, status, created_at) VALUES (?, ?, ?, ?, ?)",
-        (job_id, corpus_id, source_label, "queued", now)
-    )
-    conn.commit()
-    conn.close()
+
+    try:
+        cursor.execute("""
+            INSERT INTO jobs
+            (job_id, corpus_id, source_label, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (job_id, corpus_id, source_label, "queued", now, now))
+
+        # Ensure corpus exists
+        cursor.execute("""
+            INSERT OR IGNORE INTO corpora (corpus_id, created_at)
+            VALUES (?, ?)
+        """, (corpus_id, now))
+
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint failed" in str(e):
+            conn.close()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "collision",
+                    "message": f"source_label '{source_label}' already exists in corpus '{corpus_id}'"
+                }
+            )
+        raise
+    finally:
+        conn.close()
 
     logger.info(f"Job {job_id} queued for corpus {corpus_id}, source {source_label}")
 
@@ -309,7 +353,7 @@ async def poll_jobs(
     conn = sqlite3.connect(str(METADATA_DB_PATH))
     cursor = conn.cursor()
 
-    query = "SELECT * FROM jobs WHERE 1=1"
+    query = "SELECT job_id, corpus_id, source_label, status, created_at, updated_at, started_at, completed_at, error_message, chunks_indexed FROM jobs WHERE 1=1"
     params = []
 
     if since:
@@ -331,17 +375,17 @@ async def poll_jobs(
 
     jobs = []
     for row in rows:
-        # Convert row to dict based on schema
         jobs.append({
             "job_id": row[0],
             "corpus_id": row[1],
             "source_label": row[2],
             "status": row[3],
             "created_at": row[4],
-            "started_at": row[5],
-            "completed_at": row[6],
-            "error_message": row[7],
-            "chunks_indexed": row[8]
+            "updated_at": row[5],
+            "started_at": row[6],
+            "completed_at": row[7],
+            "error_message": row[8],
+            "chunks_indexed": row[9]
         })
 
     return {
