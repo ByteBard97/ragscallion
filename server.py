@@ -1,141 +1,358 @@
 #!/usr/bin/env python3
-"""Minimal HTTP wrapper for the RAG search CLI."""
+"""Ragscallion — Multi-corpus RAG HTTP server with async job queue."""
 
+import asyncio
+import json
+import logging
+import sqlite3
 import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from typing import Optional
 
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import JSONResponse
 import lancedb
 from lancedb.rerankers import RRFReranker
 from sentence_transformers import SentenceTransformer
+import uvicorn
+
+# ─── Configuration ──────────────────────────────────────────────────────
 
 DB_PATH = Path(__file__).parent / "vectordb"
-TABLE_NAME = "papers"
+METADATA_DB_PATH = Path(__file__).parent / "metadata.db"
+DOCS_PATH = Path(__file__).parent / "docs"
 EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 
-# Load model once at startup
-print("Loading embedding model...", flush=True)
-model = SentenceTransformer(EMBED_MODEL, device="cuda")
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ─── Global State ───────────────────────────────────────────────────────
+
+app = FastAPI(title="Ragscallion", version="0.2.0")
+embedding_model: SentenceTransformer = None
 reranker = RRFReranker()
-print("Ready.", flush=True)
+
+# Job queue locks
+MARKER_LOCK = asyncio.Lock()
+INGEST_LOCK = asyncio.Lock()
 
 
-def get_db():
+@app.on_event("startup")
+async def startup():
+    """Load embedding model at startup."""
+    global embedding_model
+    logger.info("Loading embedding model...")
+    embedding_model = SentenceTransformer(EMBED_MODEL, device="cuda")
+    logger.info("Embedding model loaded.")
+
+    # Initialize metadata database
+    _init_metadata_db()
+
+
+# ─── Database Initialization ────────────────────────────────────────────
+
+def _init_metadata_db():
+    """Create metadata.db schema if not exists."""
+    conn = sqlite3.connect(str(METADATA_DB_PATH))
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            corpus_id TEXT NOT NULL,
+            source_label TEXT NOT NULL,
+            status TEXT DEFAULT 'queued',
+            created_at TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            error_message TEXT,
+            chunks_indexed INTEGER DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS corpora (
+            corpus_id TEXT PRIMARY KEY,
+            created_at TEXT,
+            source_count INTEGER DEFAULT 0
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def _get_db():
+    """Get LanceDB connection."""
     return lancedb.connect(str(DB_PATH))
 
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
+# ─── Health & Metadata Endpoints ────────────────────────────────────────
 
-        if parsed.path == "/health":
-            self._respond(200, "ok")
-            return
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "ok"}
 
-        if parsed.path == "/search":
-            self._handle_search(parse_qs(parsed.query))
-            return
 
-        if parsed.path == "/stats":
-            self._handle_stats()
-            return
+@app.get("/stats")
+async def stats():
+    """Return index statistics (multi-corpus aware)."""
+    db = _get_db()
+    tables = db.list_tables().tables
 
-        if parsed.path == "/sources":
-            self._handle_sources()
-            return
+    if not tables:
+        return {"status": "no_index", "message": "Run ingestion first"}
 
-        self.send_error(404)
+    stats_data = {}
+    for table_name in tables:
+        try:
+            table = db.open_table(table_name)
+            df = table.to_pandas()
+            sources = df["source"].unique()
+            stats_data[table_name] = {
+                "chunks": len(df),
+                "sources": len(sources),
+                "source_list": list(sources)
+            }
+        except Exception as e:
+            logger.error(f"Error reading table {table_name}: {e}")
 
-    def _handle_search(self, params):
-        query = params.get("q", [""])[0]
-        if not query:
-            self.send_error(400, "Missing ?q= parameter")
-            return
+    return {"corpora": stats_data}
 
-        top_n = int(params.get("n", ["5"])[0])
-        source = params.get("source", [None])[0]
-        mode = params.get("mode", ["hybrid"])[0]
 
-        db = get_db()
-        if TABLE_NAME not in db.list_tables().tables:
-            self._respond(500, "No index found. Run 'rag ingest' first.")
-            return
+@app.get("/sources")
+async def sources(corpus: Optional[str] = None):
+    """List all sources across corpora or within a specific corpus."""
+    db = _get_db()
+    tables = db.list_tables().tables
 
-        table = db.open_table(TABLE_NAME)
+    if corpus:
+        if corpus not in tables:
+            raise HTTPException(status_code=404, detail=f"Corpus '{corpus}' not found")
+        tables = [corpus]
 
-        if mode == "hybrid":
-            query_embedding = model.encode([query])[0].tolist()
-            results = (
-                table.search(query_type="hybrid")
-                .vector(query_embedding)
-                .text(query)
-                .rerank(reranker)
-                .limit(top_n)
-            )
-        elif mode == "vector":
-            query_embedding = model.encode([query])[0].tolist()
-            results = table.search(query_embedding).limit(top_n)
-        elif mode == "fts":
-            results = table.search(query, query_type="fts").limit(top_n)
-        else:
-            self.send_error(400, "mode must be hybrid, vector, or fts")
-            return
+    all_sources = {}
+    for table_name in tables:
+        try:
+            table = db.open_table(table_name)
+            df = table.to_pandas()
+            all_sources[table_name] = sorted(df["source"].unique().tolist())
+        except Exception as e:
+            logger.error(f"Error reading table {table_name}: {e}")
 
-        if source:
-            results = results.where(f"source = '{source}'")
+    return {"corpora": all_sources}
 
-        results = results.to_pandas()
 
-        score_col = "_relevance_score" if "_relevance_score" in results.columns else "_distance"
+# ─── Search Endpoint ────────────────────────────────────────────────────
 
-        output = []
-        for _, row in results.iterrows():
-            score = row.get(score_col, 0)
-            page_info = f" p.{row['page']}" if row.get("page") else ""
-            output.append(
-                f"--- [{row['source']}{page_info}] {row['section']} ({score_col}: {score:.4f}) ---\n"
-                f"{row['text']}\n"
-            )
+@app.get("/search")
+async def search(q: str, n: int = 5, mode: str = "hybrid", corpus: Optional[str] = None):
+    """
+    Search across corpus or specific corpus.
 
-        self._respond(200, "\n".join(output) if output else "No results found.")
+    Parameters:
+    - q: search query
+    - n: number of results (default 5)
+    - mode: hybrid, vector, or fts (default hybrid)
+    - corpus: specific corpus to search (optional, search all if omitted)
+    """
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing ?q= parameter")
 
-    def _handle_stats(self):
-        db = get_db()
-        if TABLE_NAME not in db.list_tables().tables:
-            self._respond(200, "No index found.")
-            return
+    db = _get_db()
+    tables = db.list_tables().tables
 
-        table = db.open_table(TABLE_NAME)
-        df = table.to_pandas()
-        sources = df["source"].value_counts()
-        lines = [f"Index: {len(df)} chunks from {len(sources)} sources", ""]
-        for src, count in sources.items():
-            lines.append(f"  {src}: {count} chunks")
-        self._respond(200, "\n".join(lines))
+    if not tables:
+        raise HTTPException(status_code=500, detail="No index found. Run ingestion first.")
 
-    def _handle_sources(self):
-        db = get_db()
-        if TABLE_NAME not in db.list_tables().tables:
-            self._respond(200, "No index found.")
-            return
+    if corpus:
+        if corpus not in tables:
+            raise HTTPException(status_code=404, detail=f"Corpus '{corpus}' not found")
+        tables = [corpus]
 
-        table = db.open_table(TABLE_NAME)
-        df = table.to_pandas()
-        self._respond(200, "\n".join(sorted(df["source"].unique())))
+    results_by_corpus = {}
 
-    def _respond(self, code, text):
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(text.encode())
+    for table_name in tables:
+        try:
+            table = db.open_table(table_name)
 
-    def log_message(self, format, *args):
-        if args and (str(args[0]).startswith("4") or str(args[0]).startswith("5")):
-            super().log_message(format, *args)
+            if mode == "hybrid":
+                query_embedding = embedding_model.encode([q])[0].tolist()
+                results = (
+                    table.search(query_type="hybrid")
+                    .vector(query_embedding)
+                    .text(q)
+                    .rerank(reranker)
+                    .limit(n)
+                )
+            elif mode == "vector":
+                query_embedding = embedding_model.encode([q])[0].tolist()
+                results = table.search(query_embedding).limit(n)
+            elif mode == "fts":
+                results = table.search(q, query_type="fts").limit(n)
+            else:
+                raise HTTPException(status_code=400, detail="mode must be hybrid, vector, or fts")
 
+            results_df = results.to_pandas()
+
+            results_list = []
+            for _, row in results_df.iterrows():
+                score_col = "_relevance_score" if "_relevance_score" in results_df.columns else "_distance"
+                score = row.get(score_col, 0)
+                page_info = f" p.{row.get('page', '')}" if row.get("page") else ""
+
+                results_list.append({
+                    "source": row["source"],
+                    "section": row.get("section", ""),
+                    "page": row.get("page", ""),
+                    "text": row["text"],
+                    "score": float(score),
+                    "score_type": score_col
+                })
+
+            results_by_corpus[table_name] = results_list
+
+        except Exception as e:
+            logger.error(f"Error searching table {table_name}: {e}")
+            results_by_corpus[table_name] = []
+
+    return {"query": q, "mode": mode, "results": results_by_corpus}
+
+
+# ─── Job Submission Endpoint (Task 3) ───────────────────────────────────
+
+@app.post("/ingest")
+async def submit_ingest(
+    file: UploadFile = File(...),
+    corpus_id: str = Form(...),
+    source_label: str = Form(...),
+    on_conflict: str = Form("error"),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Submit PDF for async conversion and indexing.
+
+    Parameters:
+    - file: PDF file to ingest
+    - corpus_id: target corpus identifier (regex: ^[a-z0-9][a-z0-9_-]{0,63}$)
+    - source_label: human-readable label for this source
+    - on_conflict: error (reject if source exists) | append | replace
+
+    Returns:
+    - job_id: unique job identifier
+    - corpus_id: target corpus
+    - status: queued
+    - server_now: server's current time (RFC3339)
+    """
+    # Validate corpus_id format
+    import re
+    if not re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", corpus_id):
+        raise HTTPException(
+            status_code=400,
+            detail="corpus_id must match ^[a-z0-9][a-z0-9_-]{0,63}$"
+        )
+
+    # Check for source_label collision
+    # (Full implementation in Task 3)
+
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Store job metadata
+    conn = sqlite3.connect(str(METADATA_DB_PATH))
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO jobs (job_id, corpus_id, source_label, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        (job_id, corpus_id, source_label, "queued", now)
+    )
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Job {job_id} queued for corpus {corpus_id}, source {source_label}")
+
+    # Queue job for processing (background task — implemented in Task 5)
+    # For now, just return immediately
+
+    return {
+        "job_id": job_id,
+        "corpus_id": corpus_id,
+        "status": "queued",
+        "server_now": datetime.now(timezone.utc).isoformat() + "Z"
+    }
+
+
+# ─── Job Polling Endpoint (Task 4) ──────────────────────────────────────
+
+@app.get("/jobs")
+async def poll_jobs(
+    since: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100
+):
+    """
+    Poll for completed jobs.
+
+    Parameters:
+    - since: RFC3339 timestamp — return jobs updated after this time
+    - status: comma-separated (ready,failed)
+    - limit: max results (default 100)
+
+    Returns:
+    - jobs: list of job objects
+    - server_now: server's current time (RFC3339) — use this for next poll
+    """
+    conn = sqlite3.connect(str(METADATA_DB_PATH))
+    cursor = conn.cursor()
+
+    query = "SELECT * FROM jobs WHERE 1=1"
+    params = []
+
+    if since:
+        query += " AND updated_at > ?"
+        params.append(since)
+
+    if status:
+        statuses = [s.strip() for s in status.split(",")]
+        placeholders = ",".join(["?" for _ in statuses])
+        query += f" AND status IN ({placeholders})"
+        params.extend(statuses)
+
+    query += " ORDER BY updated_at DESC LIMIT ?"
+    params.append(limit)
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    jobs = []
+    for row in rows:
+        # Convert row to dict based on schema
+        jobs.append({
+            "job_id": row[0],
+            "corpus_id": row[1],
+            "source_label": row[2],
+            "status": row[3],
+            "created_at": row[4],
+            "started_at": row[5],
+            "completed_at": row[6],
+            "error_message": row[7],
+            "chunks_indexed": row[8]
+        })
+
+    return {
+        "jobs": jobs,
+        "server_now": datetime.now(timezone.utc).isoformat() + "Z"
+    }
+
+
+# ─── Main ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    print(f"RAG server listening on 0.0.0.0:{port}", flush=True)
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    logger.info(f"Ragscallion listening on 0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
