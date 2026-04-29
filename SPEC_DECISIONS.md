@@ -1,0 +1,138 @@
+# Ragscallion Multi-Corpus Spec — Locked Decisions
+
+**Date:** 2026-04-29  
+**Status:** Approved for implementation
+
+## Architectural Decisions (Locked)
+
+### 1. Device → Corpus Mapping
+**Decision:** Orchestrator chooses. Ragscallion stays dumb about device taxonomy.
+
+**Implication:** If two chip variants share a datasheet, orchestrator aliases them to the same `corpus_id`. If separate docs, separate corpora. Ragscallion accepts any valid `corpus_id` and doesn't validate device relationships.
+
+**API contract:** `POST /ingest` requires `corpus_id` (required). Orchestrator is responsible for mapping devices to corpora.
+
+---
+
+### 2. Polling-only Notification (v0.2)
+**Decision:** Start with polling. Webhooks/SSE deferred to v0.3.
+
+**Mechanism:** Orchestrator polls `GET /jobs?since=<last_check>&status=ready,failed` every 2-5 seconds. Single call returns all completed jobs since last poll. No need for Mac-side webhook server.
+
+**Implication:** Harness adds a polling loop in the pipeline that checks for job completions between device submissions.
+
+**API contract:** `GET /jobs` returns jobs ordered by `updated_at` descending, filtered by `since` timestamp (RFC3339), `status`, `limit`.
+
+---
+
+### 3. Job ID Ownership
+**Decision:** Ragscallion generates job_id (UUID). Orchestrator controls corpus_id.
+
+**Reasoning:** One device (corpus_id) can have multiple ingest jobs over time (initial PDF, errata, revision). job_id is an internal tracking handle per ingest operation. corpus_id is the stable identity for querying.
+
+**API contract:**
+- Request: `POST /ingest?corpus_id=yamaha-r08d`
+- Response: `{ "job_id": "a1b2c3d4-...", "corpus_id": "yamaha-r08d", "status": "queued" }`
+
+---
+
+### 5. Existing Data Migration
+**Decision:** Treat current 230 sources as one legacy corpus (`legacy` or `default`).
+
+**Rationale:** Device taxonomy not yet mapped. Legacy data remains searchable for backward compatibility. New devices ingested into properly-named corpora. Can selectively re-ingest legacy data into device-specific corpora later as taxonomy is built.
+
+**Implementation:** Migration script on startup detects old layout, creates `legacy` corpus from existing `papers` table, moves `docs/*.md` to `docs/legacy/`.
+
+---
+
+### 6. Marker Timeout
+**Decision:** Default 600 seconds (10 min). On timeout: kill subprocess, mark job failed, release lock.
+
+**Configuration:** `MARKER_TIMEOUT_SECONDS=600` in config.
+
+**Behavior:** 
+- Subprocess runs with timeout via `asyncio.wait_for()`
+- On timeout: `job.status = "failed"`, `job.error = "Marker timeout after 600s"`
+- Release MARKER_LOCK immediately so next job proceeds
+- Orchestrator decides whether to resubmit
+
+**Rationale:** Prevents one bad PDF from wedging the entire pipeline indefinitely.
+
+---
+
+### 7. Concurrency — Marker
+**Decision:** Hard constraint of 1 concurrent Marker process. Max 16GB card.
+
+**Configuration:** `MAX_CONCURRENT_MARKER=1` (future-proofing for 48GB+ cards, but ship with 1).
+
+**Rationale:** Two Marker processes on a 16GB GPU will OOM or thrash. Single MARKER_LOCK enforces this.
+
+**Documentation:** README must explain why concurrent Marker is not supported and when to upgrade hardware.
+
+---
+
+### 8. Dependencies — FastAPI
+**Decision:** Add FastAPI + uvicorn + python-multipart.
+
+**Rationale:** Required for multipart file uploads, async background tasks, future SSE support. Three new dependencies is acceptable.
+
+**README Update:** Clarify "no frameworks" refers to RAG frameworks (LangChain, LlamaIndex), not web frameworks. FastAPI is appropriate for HTTP service with async patterns.
+
+---
+
+## Corpus ID Format (Locked)
+
+**Regex:** `^[a-z0-9][a-z0-9_-]{0,63}$`
+
+- Start with lowercase alphanumeric (a-z, 0-9)
+- Followed by 0–63 chars of lowercase alphanumeric, hyphen, underscore
+- Max 64 characters total
+- Examples: `yamaha-r08d`, `st_32f407vg`, `legacy`, `default-v2`
+
+**Validation:** Return 400 Bad Request if corpus_id doesn't match.
+
+**Orchestrator responsibility:** Normalize device names to this format on the Mac side before submitting.
+
+---
+
+## Implementation Order
+
+**Phase A (Required for API contract):**
+1. FastAPI server with multipart upload support
+2. SQLite metadata.db (aliases, jobs tables)
+3. Multi-corpus LanceDB layout (one table per corpus_id)
+4. Job lifecycle state machine (queued → awaiting_marker → converting → awaiting_ingest → ingesting → ready/failed)
+5. MARKER_LOCK and INGEST_LOCK (asyncio.Lock)
+6. Marker timeout handling
+7. Polling endpoints (`GET /jobs?since=X&status=ready`)
+8. Corpus ID validation
+
+**Phase B (Operations):**
+1. Migration of existing single-corpus data to `legacy`
+2. Storage accounting (`GET /storage`)
+3. Lifecycle endpoints (`DELETE /corpus/{corpus_id}`)
+4. Alias resolution (`GET /resolve?name=...`)
+
+**Phase C (Future):**
+1. Server-Sent Events for notifications
+2. Webhooks
+3. Cross-corpus search
+
+---
+
+## Summary Table
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Device → corpus | Orchestrator chooses | Ragscallion agnostic about device taxonomy |
+| Notifications | Polling (`GET /jobs?since=`) | Simple, sufficient for same-network single-user |
+| Job ID | Ragscallion generates (UUID) | Tracks *ingest job*, not device identity |
+| Corpus ID | Orchestrator chooses, regex validated | Orchestrator controls taxonomy; format enforced |
+| Marker timeout | 600s, kill subprocess, mark failed | Prevents wedging; orchestrator retries if needed |
+| Concurrent Marker | 1 (MAX_CONCURRENT_MARKER=1) | 16GB GPU limitation; document why |
+| FastAPI | Yes | Multipart, async, future SSE support |
+
+---
+
+**Approved by:** Geoffrey (user), Claude (agent)  
+**Ready for:** Implementation sprint
