@@ -17,11 +17,17 @@
 ### 2. Polling-only Notification (v0.2)
 **Decision:** Start with polling. Webhooks/SSE deferred to v0.3.
 
-**Mechanism:** Orchestrator polls `GET /jobs?since=<last_check>&status=ready,failed` every 2-5 seconds. Single call returns all completed jobs since last poll. No need for Mac-side webhook server.
+**Mechanism:** Orchestrator polls `GET /jobs?since=<last_check>&status=ready,failed` every 3 seconds. Single call returns all completed jobs since last poll. No need for Mac-side webhook server.
 
 **Implication:** Harness adds a polling loop in the pipeline that checks for job completions between device submissions.
 
 **API contract:** `GET /jobs` returns jobs ordered by `updated_at` descending, filtered by `since` timestamp (RFC3339), `status`, `limit`.
+
+**Timestamp handling (critical):**
+- Harness captures `last_check = datetime.now()` *before* starting the HTTP request
+- Ragscallion echoes back its server time in every `/jobs` response: `{ "jobs": [...], "server_now": "2026-04-29T15:52:30.123456Z" }`
+- Harness uses `server_now` for the next poll's `since` parameter, not the Mac's clock
+- Rationale: Eliminates clock skew between machines causing silent job misses. Job status can transition *during* the HTTP request; capturing `last_check` before prevents race conditions.
 
 ---
 
@@ -80,6 +86,48 @@
 
 ---
 
+### 9. Corpus ID Collision Handling
+**Decision:** Smart append-or-error policy based on source identity.
+
+**Rules:**
+- **New corpus_id** → Create corpus, ingest PDF with source_label
+- **Existing corpus_id + new source_label** → Append (intentional multi-PDF case: datasheet + errata + app note all indexed in same corpus)
+- **Existing corpus_id + duplicate source_label** → Error (accidental re-submission, requires explicit override)
+
+**API contract:**
+```bash
+POST /ingest?corpus_id=yamaha-r08d&source_label=yamaha-r08d-manual&on_conflict=error
+```
+
+**on_conflict values:**
+- `error` (default): Reject if source_label already exists in corpus
+- `append`: Add new chunks alongside existing (intentional multi-PDF)
+- `replace`: Delete old source_label chunks, ingest new PDF (user explicitly wants to refresh)
+
+**Rationale:** Default to safe-fail (error) prevents silent corruption from accidental re-submissions. Append mode lets users build comprehensive knowledge bases. Replace mode supports iterative PDF refinement.
+
+---
+
+### 10. Transient Failure Retry Policy
+**Decision:** Retry transient failures with exponential backoff; fail-fast on 4xx.
+
+**Policy:**
+- **5xx, timeout, connection refused** → Retry up to 3 times with backoff: 1s, 4s, 16s
+- **4xx (400, 422, etc.)** → Don't retry. That's a real error (bad request, validation failed)
+- **Network failure** → Retry same as 5xx
+
+**Applies to:**
+- `POST /ingest` submission failures
+- `GET /jobs` polling failures
+
+**Behavior:**
+- After 3 submission failures → Move node to queue_4 with category `RAGSCALLION_UNAVAILABLE`
+- After 3 polling failures → Log ERROR but don't fail in-flight nodes. They'll resume on next successful poll.
+
+**Rationale:** Real-world Ragscallion has brief unavailability (restarts, GPU resets, network hiccups). Retry masks transient issues. Client-side 4xx means bad data or configuration — don't thrash.
+
+---
+
 ## Corpus ID Format (Locked)
 
 **Regex:** `^[a-z0-9][a-z0-9_-]{0,63}$`
@@ -125,12 +173,14 @@
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Device → corpus | Orchestrator chooses | Ragscallion agnostic about device taxonomy |
-| Notifications | Polling (`GET /jobs?since=`) | Simple, sufficient for same-network single-user |
+| Notifications | Polling (`GET /jobs?since=`) with server time echo | Simple, sufficient for same-network single-user; server_now prevents clock skew |
 | Job ID | Ragscallion generates (UUID) | Tracks *ingest job*, not device identity |
 | Corpus ID | Orchestrator chooses, regex validated | Orchestrator controls taxonomy; format enforced |
 | Marker timeout | 600s, kill subprocess, mark failed | Prevents wedging; orchestrator retries if needed |
 | Concurrent Marker | 1 (MAX_CONCURRENT_MARKER=1) | 16GB GPU limitation; document why |
 | FastAPI | Yes | Multipart, async, future SSE support |
+| Collision handling | Smart append-or-error (source_label-based) | Prevent accidental dupes while allowing intentional multi-PDF |
+| Transient retry | Max 3 attempts, backoff: 1s/4s/16s | Mask real-world unavailability; fail-fast on 4xx |
 
 ---
 
