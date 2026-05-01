@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import sys
 import uuid
@@ -17,6 +18,8 @@ import lancedb
 from lancedb.rerankers import RRFReranker
 from sentence_transformers import SentenceTransformer
 import uvicorn
+
+from ingest import process_job
 
 # ─── Configuration ──────────────────────────────────────────────────────
 
@@ -56,8 +59,13 @@ async def startup():
     """Load embedding model at startup."""
     global embedding_model, job_processor_task
     logger.info("Loading embedding model...")
-    embedding_model = SentenceTransformer(EMBED_MODEL, device="cuda")
-    logger.info("Embedding model loaded.")
+    try:
+        embedding_model = SentenceTransformer(EMBED_MODEL, device="cuda")
+        logger.info("Embedding model loaded on GPU.")
+    except RuntimeError as e:
+        logger.warning(f"GPU not available ({e}), falling back to CPU...")
+        embedding_model = SentenceTransformer(EMBED_MODEL, device="cpu")
+        logger.info("Embedding model loaded on CPU.")
 
     # Initialize metadata database
     _init_metadata_db()
@@ -160,77 +168,6 @@ def _update_job_status(job_id: str, status: str, error_message: Optional[str] = 
     conn.close()
 
 
-async def _process_job(job_id: str):
-    """Process a single ingestion job through the pipeline.
-
-    States: queued → awaiting_marker → converting → awaiting_ingest → ingesting → ready/failed
-    """
-    try:
-        # Get job metadata
-        conn = sqlite3.connect(str(METADATA_DB_PATH))
-        cursor = conn.cursor()
-        cursor.execute("SELECT corpus_id, source_label FROM jobs WHERE job_id = ?", (job_id,))
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row:
-            logger.error(f"Job {job_id} not found")
-            return
-
-        corpus_id, source_label = row
-        pdf_path = Path(__file__).parent / "staging" / f"{job_id}.pdf"
-
-        if not pdf_path.exists():
-            _update_job_status(job_id, "failed", f"PDF file not found: {pdf_path}")
-            return
-
-        # ─── Stage 1: Acquire MARKER_LOCK, run Marker conversion ─────────
-        _update_job_status(job_id, "awaiting_marker")
-
-        async with MARKER_LOCK:
-            _update_job_status(job_id, "converting")
-
-            try:
-                # Run Marker with timeout (TODO: integrate actual Marker)
-                # For now, stub: pretend conversion succeeds after 1 second
-                logger.info(f"[STUB] Converting PDF for job {job_id}...")
-                await asyncio.sleep(1)  # Simulated conversion
-                markdown_path = Path(__file__).parent / "converted" / f"{job_id}.md"
-                markdown_path.parent.mkdir(exist_ok=True)
-                markdown_path.write_text(f"# {source_label}\n\nConverted PDF content (stub).\n")
-
-            except asyncio.TimeoutError:
-                _update_job_status(job_id, "failed", f"Marker timeout after {MARKER_TIMEOUT_SECONDS}s")
-                pdf_path.unlink()
-                return
-            except Exception as e:
-                _update_job_status(job_id, "failed", f"Marker failed: {e}")
-                return
-
-        # ─── Stage 2: Acquire INGEST_LOCK, chunk/embed/index ────────────
-        _update_job_status(job_id, "awaiting_ingest")
-
-        async with INGEST_LOCK:
-            _update_job_status(job_id, "ingesting")
-
-            try:
-                # TODO: Integrate rag.py chunking and embedding
-                # For now, stub: pretend ingest succeeds after 2 seconds
-                logger.info(f"[STUB] Ingesting markdown for job {job_id} into corpus {corpus_id}...")
-                await asyncio.sleep(2)  # Simulated ingest
-
-                chunks_indexed = 42  # Stub value
-                _update_job_status(job_id, "ready", chunks_indexed=chunks_indexed)
-                logger.info(f"Job {job_id} completed: {chunks_indexed} chunks indexed in corpus {corpus_id}")
-
-            except Exception as e:
-                _update_job_status(job_id, "failed", f"Ingest failed: {e}")
-
-    except Exception as e:
-        logger.error(f"Job processor error for {job_id}: {e}")
-        _update_job_status(job_id, "failed", f"Unexpected error: {e}")
-
-
 async def _run_job_processor():
     """Background task: continuously process queued jobs."""
     logger.info("Job processor loop started")
@@ -247,7 +184,15 @@ async def _run_job_processor():
             if row:
                 job_id = row[0]
                 logger.info(f"Processing job {job_id}")
-                await _process_job(job_id)
+                await process_job(
+                    job_id,
+                    metadata_db_path=METADATA_DB_PATH,
+                    embedding_model=embedding_model,
+                    get_db=_get_db,
+                    corpus_table_name=corpus_table_name,
+                    marker_lock=MARKER_LOCK,
+                    ingest_lock=INGEST_LOCK,
+                )
             else:
                 # No queued jobs, sleep briefly
                 await asyncio.sleep(1)
@@ -465,7 +410,6 @@ async def submit_ingest(
         raise HTTPException(status_code=400, detail="File must be a PDF")
 
     # Validate corpus_id format
-    import re
     if not re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", corpus_id):
         raise HTTPException(
             status_code=400,
