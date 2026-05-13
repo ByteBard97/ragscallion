@@ -85,9 +85,6 @@ async def shutdown():
             await job_processor_task
         except asyncio.CancelledError:
             pass
-    from ingest import _restart_marker_pool
-    _restart_marker_pool()
-    logger.info("Marker pool terminated")
 
 
 # ─── Database Initialization ────────────────────────────────────────────
@@ -409,15 +406,8 @@ async def submit_ingest(
     - server_now: server's current time (RFC3339)
     """
     # Validate file type
-    ALLOWED_EXTENSIONS = {".pdf", ".md", ".html", ".htm", ".txt"}
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="File required")
-    file_ext = Path(file.filename).suffix.lower()
-    if file_ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File must be one of: {', '.join(ALLOWED_EXTENSIONS)}"
-        )
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
 
     # Validate corpus_id format
     if not re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", corpus_id):
@@ -437,17 +427,16 @@ async def submit_ingest(
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    # Save uploaded file to staging directory
+    # Save PDF to staging directory
     staging_dir = Path(__file__).parent / "staging"
     staging_dir.mkdir(exist_ok=True)
-    file_ext = Path(file.filename).suffix.lower()
-    staging_path = staging_dir / f"{job_id}{file_ext}"
+    pdf_path = staging_dir / f"{job_id}.pdf"
 
     try:
         # Write uploaded file to disk
         contents = await file.read()
-        staging_path.write_bytes(contents)
-        logger.info(f"Saved {file_ext} to {staging_path} ({len(contents)} bytes)")
+        pdf_path.write_bytes(contents)
+        logger.info(f"Saved PDF to {pdf_path} ({len(contents)} bytes)")
     except Exception as e:
         logger.error(f"Failed to save PDF: {e}")
         raise HTTPException(status_code=500, detail="Failed to save uploaded file")
@@ -465,7 +454,7 @@ async def submit_ingest(
         existing = cursor.fetchone()
 
         if existing and on_conflict == "error":
-            staging_path.unlink()  # Clean up the uploaded file
+            pdf_path.unlink()  # Clean up the uploaded file
             conn.close()
             raise HTTPException(
                 status_code=409,
@@ -473,12 +462,6 @@ async def submit_ingest(
                     "error": "collision",
                     "message": f"source_label '{source_label}' already exists in corpus '{corpus_id}'"
                 }
-            )
-
-        if existing and on_conflict == "replace":
-            cursor.execute(
-                "DELETE FROM jobs WHERE corpus_id = ? AND source_label = ?",
-                (corpus_id, source_label)
             )
 
         # Insert new job
@@ -497,7 +480,7 @@ async def submit_ingest(
         conn.commit()
 
     except sqlite3.IntegrityError as e:
-        staging_path.unlink()
+        pdf_path.unlink()
         logger.error(f"Database error: {e}")
         raise HTTPException(status_code=500, detail="Failed to queue job")
     finally:
