@@ -85,9 +85,9 @@ async def shutdown():
             await job_processor_task
         except asyncio.CancelledError:
             pass
-    from ingest import _restart_marker_pool
-    _restart_marker_pool()
-    logger.info("Marker pool terminated")
+    from ingest import shutdown_marker
+    shutdown_marker()
+    logger.info("Marker models released")
 
 
 # ─── Database Initialization ────────────────────────────────────────────

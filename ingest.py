@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import multiprocessing
 import os
 import re
 import signal
@@ -21,74 +20,71 @@ CHUNK_OVERLAP_CHARS = 200
 MARKER_TIMEOUT_SECONDS = 600  # 10 minutes max per PDF
 
 
-# ─── Persistent Marker Pool (multiprocessing spawn) ─────────────────────
+# ─── Persistent Marker model (in-process threading) ─────────────────────
+#
+# Models load once on first job and stay resident in GPU memory.
+# multiprocessing.Pool(spawn) was attempted but fails because Surya's
+# DataLoader spawns subprocesses internally and Pool workers are daemon
+# processes (daemon processes cannot have children).
+#
+# In-process trade-offs vs subprocess:
+#   + No 8s model reload per job
+#   + No daemonic subprocess issue
+#   - Model lives in server process (shares VRAM — fine, ~6GB of 16GB)
+#   - Timeout cancels the asyncio awaitable but not the thread (rare case)
+#   - Marker crash resets model state; next job reloads
 
-_w_models = None
-_w_converter = None
+_marker_models = None
+_marker_converter = None
+_marker_load_lock = threading.Lock()
 
 
-def _marker_worker_init():
-    """Pool worker initializer: load Marker models once into GPU."""
-    global _w_models, _w_converter
-    import torch
-    torch.backends.cudnn.enabled = False  # must happen before any marker import (Blackwell fix)
-    from marker.models import create_model_dict
-    from marker.converters.pdf import PdfConverter
-    _w_models = create_model_dict()
-    _w_converter = PdfConverter(artifact_dict=_w_models)
+def _ensure_marker_loaded() -> None:
+    global _marker_models, _marker_converter
+    if _marker_converter is not None:
+        return
+    with _marker_load_lock:
+        if _marker_converter is not None:
+            return
+        import torch
+        torch.backends.cudnn.enabled = False  # must precede any marker import (Blackwell/RTX 5080)
+        from marker.models import create_model_dict
+        from marker.converters.pdf import PdfConverter
+        logger.info("Loading Marker models into GPU (one-time)...")
+        _marker_models = create_model_dict()
+        _marker_converter = PdfConverter(artifact_dict=_marker_models)
+        logger.info("Marker models loaded.")
 
 
-def _marker_worker_convert(pdf_path_str: str) -> str:
-    """Pool worker: convert one PDF to markdown. Returns markdown string."""
-    rendered = _w_converter(pdf_path_str)
-    # Extract markdown — try .markdown attr first, fall back to text_from_rendered
-    if hasattr(rendered, 'markdown'):
-        return rendered.markdown
+def _convert_with_marker(pdf_path_str: str) -> str:
+    """Synchronous: convert PDF to markdown using the persistent in-process model.
+
+    Resets model state on exception so the next job reloads cleanly.
+    """
+    global _marker_models, _marker_converter
     try:
-        from marker.output import text_from_rendered
-        text, _, _ = text_from_rendered(rendered)
-        return text
+        _ensure_marker_loaded()
+        rendered = _marker_converter(pdf_path_str)
+        if hasattr(rendered, 'markdown'):
+            return rendered.markdown
+        try:
+            from marker.output import text_from_rendered
+            text, _, _ = text_from_rendered(rendered)
+            return text
+        except Exception:
+            return str(rendered)
     except Exception:
-        return str(rendered)
-
-
-_marker_pool: Optional[multiprocessing.pool.Pool] = None
-_marker_pool_lock = threading.Lock()
-
-
-def _get_marker_pool() -> multiprocessing.pool.Pool:
-    global _marker_pool
-    with _marker_pool_lock:
-        if _marker_pool is None:
-            ctx = multiprocessing.get_context('spawn')
-            _marker_pool = ctx.Pool(1, initializer=_marker_worker_init)
-    return _marker_pool
-
-
-def _restart_marker_pool() -> None:
-    global _marker_pool
-    with _marker_pool_lock:
-        if _marker_pool is not None:
-            try:
-                _marker_pool.terminate()
-                _marker_pool.join()
-            except Exception:
-                pass
-            _marker_pool = None
-
-
-def _convert_in_pool(pdf_path_str: str) -> str:
-    """Synchronous wrapper: submit to pool worker, wait with timeout, restart pool on failure."""
-    pool = _get_marker_pool()
-    result = pool.apply_async(_marker_worker_convert, (pdf_path_str,))
-    try:
-        return result.get(timeout=MARKER_TIMEOUT_SECONDS)
-    except multiprocessing.TimeoutError:
-        _restart_marker_pool()
-        raise RuntimeError(f"Marker timeout after {MARKER_TIMEOUT_SECONDS}s")
-    except Exception:
-        _restart_marker_pool()
+        # Reset so the next job gets a fresh model rather than a broken one
+        _marker_models = None
+        _marker_converter = None
         raise
+
+
+def shutdown_marker() -> None:
+    """Release Marker model state (called from server shutdown)."""
+    global _marker_models, _marker_converter
+    _marker_models = None
+    _marker_converter = None
 
 
 def _chunk_markdown(text: str, source: str) -> list[dict]:
@@ -266,7 +262,7 @@ async def process_job(
                 _update_job_status(job_id, "converting", metadata_db_path=metadata_db_path)
                 try:
                     logger.info(f"Running Marker conversion for job {job_id}...")
-                    markdown_content = await asyncio.to_thread(_convert_in_pool, str(input_path))
+                    markdown_content = await asyncio.to_thread(_convert_with_marker, str(input_path))
 
                     converted_dir = metadata_db_path.parent / "converted"
                     converted_dir.mkdir(exist_ok=True)
@@ -274,7 +270,6 @@ async def process_job(
                     logger.info(f"Marker conversion successful for {job_id}")
 
                 except asyncio.CancelledError:
-                    _restart_marker_pool()
                     _update_job_status(job_id, "failed", "Marker cancelled", metadata_db_path=metadata_db_path)
                     input_path.unlink(missing_ok=True)
                     return
